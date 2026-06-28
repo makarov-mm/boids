@@ -2,18 +2,72 @@
 #include <algorithm>
 #include <cmath>
 #include <thread>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+
+// Persistent worker pool: threads are created ONCE and parked on a condition
+// variable, then woken per parallelFor. No per-frame thread create/join.
+class ThreadPool {
+public:
+    explicit ThreadPool(int n) : n_(n) {
+        for (int t = 1; t < n_; ++t)
+            workers_.emplace_back([this, t] { workerLoop(t); });
+    }
+    ~ThreadPool() {
+        { std::lock_guard<std::mutex> lk(m_); stop_ = true; } cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
+    // Split [0,n) into n_ contiguous ranges; run range 0 on the caller.
+    void run(int n, const std::function<void(int, int)>& body) {
+        body_ = &body; n_total_ = n;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            remaining_ = n_ - 1;       // workers that must finish
+            ++epoch_;                  // signal new job
+        }
+        cv_.notify_all();
+        auto [b, e] = range(0);
+        body(b, e);                    // caller does its share
+        std::unique_lock<std::mutex> lk(doneM_);
+        doneCv_.wait(lk, [this] { return remaining_ == 0; });
+    }
+private:
+    std::pair<int, int> range(int t) const {
+        int chunk = (n_total_ + n_ - 1) / n_;
+        int b = std::min(t * chunk, n_total_), e = std::min(b + chunk, n_total_);
+        return { b, e };
+    }
+    void workerLoop(int t) {
+        uint64_t seen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&] { return stop_ || epoch_ != seen; });
+            if (stop_) return;
+            seen = epoch_;
+            lk.unlock();
+            auto [b, e] = range(t);
+            (*body_)(b, e);
+            { std::lock_guard<std::mutex> dl(doneM_); if (--remaining_ == 0) doneCv_.notify_one(); }
+        }
+    }
+    int n_;
+    std::vector<std::thread> workers_;
+    std::mutex m_, doneM_;
+    std::condition_variable cv_, doneCv_;
+    const std::function<void(int, int)>* body_ = nullptr;
+    int n_total_ = 0, remaining_ = 0;
+    uint64_t epoch_ = 0;
+    bool stop_ = false;
+};
 
 template <class Fn>
 static void parallelFor(int n, int threads, Fn&& fn) {
     if (threads <= 1 || n < 2048) { for (int i = 0; i < n; ++i) fn(i); return; }
-    std::vector<std::thread> pool;
-    int chunk = (n + threads - 1) / threads;
-    for (int t = 0; t < threads; ++t) {
-        int b = t * chunk, e = std::min(b + chunk, n);
-        if (b >= e) break;
-        pool.emplace_back([&fn, b, e]() { for (int i = b; i < e; ++i) fn(i); });
-    }
-    for (auto& th : pool) th.join();
+    static int cached = 0;                 // step() is always called from one thread
+    static std::unique_ptr<ThreadPool> pool;
+    if (!pool || cached != threads) { pool = std::make_unique<ThreadPool>(threads); cached = threads; }
+    pool->run(n, [&fn](int b, int e) { for (int i = b; i < e; ++i) fn(i); });
 }
 
 static inline uint32_t xorshift(uint64_t& s) {
@@ -40,18 +94,18 @@ Boids::Boids(const BoidsParams& p) : p_(p) {
     Vec3 c = (p_.boundsMin + p_.boundsMax) * 0.5f;
     Vec3 ext = (p_.boundsMax - p_.boundsMin);
     for (int i = 0; i < n; ++i) {
-        pos_[i] = {c.x + frand(s, -0.3f, 0.3f) * ext.x,
+        pos_[i] = { c.x + frand(s, -0.3f, 0.3f) * ext.x,
                    c.y + frand(s, -0.3f, 0.3f) * ext.y,
-                   c.z + frand(s, -0.3f, 0.3f) * ext.z};
-        Vec3 d{frand(s, -1, 1), frand(s, -1, 1), frand(s, -1, 1)};
+                   c.z + frand(s, -0.3f, 0.3f) * ext.z };
+        Vec3 d{ frand(s, -1, 1), frand(s, -1, 1), frand(s, -1, 1) };
         vel_[i] = setMag(d, frand(s, p_.minSpeed, p_.maxSpeed));
     }
     ppos_.resize(p_.predators); pvel_.resize(p_.predators);
     for (int i = 0; i < p_.predators; ++i) {
-        ppos_[i] = {frand(s, p_.boundsMin.x, p_.boundsMax.x),
+        ppos_[i] = { frand(s, p_.boundsMin.x, p_.boundsMax.x),
                     frand(s, p_.boundsMin.y, p_.boundsMax.y),
-                    frand(s, p_.boundsMin.z, p_.boundsMax.z)};
-        Vec3 d{frand(s, -1, 1), frand(s, -1, 1), frand(s, -1, 1)};
+                    frand(s, p_.boundsMin.z, p_.boundsMax.z) };
+        Vec3 d{ frand(s, -1, 1), frand(s, -1, 1), frand(s, -1, 1) };
         pvel_[i] = setMag(d, p_.predatorMaxSpeed * 0.6f);
     }
 }
@@ -78,7 +132,7 @@ void Boids::step() {
             if (dist2 > per2 || dist2 < 1e-8f) return;
             cohSum += pos_[j]; aliSum += vel_[j]; ++cohCount; ++aliCount;
             if (dist2 < sep2) sepSum += d * (1.0f / dist2);   // weighted push apart
-        });
+            });
 
         Vec3 acc{};
         if (aliCount > 0) {
@@ -124,7 +178,7 @@ void Boids::step() {
         }
 
         acc_[i] = acc;
-    });
+        });
 
     // Phase 2: integrate boids.
     parallelFor(n, threads_, [&](int i) {
@@ -134,7 +188,7 @@ void Boids::step() {
         else if (sp < p_.minSpeed && sp > 1e-5f) v = v * (p_.minSpeed / sp);
         vel_[i] = v;
         pos_[i] += v * p_.dt;
-    });
+        });
 
     // Predators: seek the nearest boid, bounce softly off walls.
     for (int k = 0; k < (int)ppos_.size(); ++k) {
@@ -144,7 +198,7 @@ void Boids::step() {
         grid_.forNeighbors(pk, [&](int j) {
             float d2 = (pos_[j] - pk).lengthSquared();
             if (d2 < bestD2) { bestD2 = d2; best = j; }
-        });
+            });
         if (best < 0) {
             for (int j = 0; j < n; j += 7) {
                 float d2 = (pos_[j] - pk).lengthSquared();

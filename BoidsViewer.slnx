@@ -2,5 +2,5 @@
   <Configurations>
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="BoidsViewer.vcxproj" />
+  <Project Path="BoidsViewer.vcxproj" Id="7c4e2a11-5d38-4b92-9a1e-6f3c8b2d7e50" />
 </Solution>
