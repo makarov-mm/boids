@@ -1,13 +1,13 @@
 #pragma once
 // 8-bit coverage font atlas (DejaVu Sans Mono), ASCII 32..126.
 // Glyphs laid out horizontally; row-major, 855 x 16.
-static const int FONT_FIRST = 32;
-static const int FONT_COUNT = 95;
-static const int FONT_CW = 9;
-static const int FONT_CH = 16;
-static const int FONT_W = 855;
-static const int FONT_H = 16;
-static const unsigned char FONT_PIX[13680] = {
+inline constexpr int FONT_FIRST = 32;
+inline constexpr int FONT_COUNT = 95;
+inline constexpr int FONT_CW    = 9;     // glyph cell width
+inline constexpr int FONT_CH    = 16;    // glyph cell height
+inline constexpr int FONT_W     = FONT_COUNT * FONT_CW;
+inline constexpr int FONT_H     = FONT_CH;
+inline constexpr unsigned char FONT_PIX[FONT_W * FONT_H] = {
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,

@@ -1,67 +1,80 @@
 #pragma once
-#include "vec3.hpp"
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <vector>
 
+#include "vec3.hpp"
+
 // Uniform spatial hash over an axis-aligned box. Cell size = neighbour radius,
-// so each query visits its own cell plus the 26 neighbours. Built with a
-// counting sort: O(N), cache-friendly, no per-cell allocations.
+// so a query visits its own cell plus the 26 neighbours. Built with a stable
+// counting sort: O(N), no per-cell allocations, and every cell lists its
+// points in increasing index order.
 class HashGrid {
 public:
-    void build(const std::vector<Vec3>& p, float cellSize, const Vec3& mn, const Vec3& mx) {
-        cell_ = cellSize;
+    // Points outside [mn, mx] are clamped into the border cells.
+    void build(std::span<const Vec3> points, float cellSize, const Vec3& mn, const Vec3& mx) {
         inv_ = 1.0f / cellSize;
-        mn_ = mn;
-        nx_ = std::max(1, (int)std::ceil((mx.x - mn.x) * inv_));
-        ny_ = std::max(1, (int)std::ceil((mx.y - mn.y) * inv_));
-        nz_ = std::max(1, (int)std::ceil((mx.z - mn.z) * inv_));
-        const int nc = nx_ * ny_ * nz_;
-        const int n = (int)p.size();
+        mn_  = mn;
+        nx_  = std::max(1, static_cast<int>(std::ceil((mx.x - mn.x) * inv_)));
+        ny_  = std::max(1, static_cast<int>(std::ceil((mx.y - mn.y) * inv_)));
+        nz_  = std::max(1, static_cast<int>(std::ceil((mx.z - mn.z) * inv_)));
+        const int cells = nx_ * ny_ * nz_;
+        const int n     = static_cast<int>(points.size());
 
         cellOf_.resize(n);
-        start_.assign(nc + 1, 0);
+        start_.assign(cells + 1, 0);
         for (int i = 0; i < n; ++i) {
-            int c = cellIndex(p[i]);
+            const int c = cellIndex(points[i]);
             cellOf_[i] = c;
             ++start_[c + 1];
         }
-        for (int c = 0; c < nc; ++c) start_[c + 1] += start_[c];
+        for (int c = 0; c < cells; ++c) start_[c + 1] += start_[c];
+
+        cursor_.assign(start_.begin(), start_.end() - 1);
         order_.resize(n);
-        std::vector<int> cur(start_.begin(), start_.end() - 1);
-        for (int i = 0; i < n; ++i) order_[cur[cellOf_[i]]++] = i;
+        for (int i = 0; i < n; ++i) order_[cursor_[cellOf_[i]]++] = i;
     }
 
-    // Visit every candidate index in the 3x3x3 block of cells around `pos`.
+    // Point indices sorted by cell. Each cell's slice is contiguous, so per-
+    // point data gathered in this order is read sequentially by the queries.
+    [[nodiscard]] std::span<const int> order() const noexcept { return order_; }
+
+    // Calls fn(begin, end) for the slices of order() that cover the 3x3x3
+    // block of cells around `pos`: one slice per row of up to three cells
+    // (adjacent cells in x are adjacent in order()), in (z, y, x) order.
     template <class Fn>
-    void forNeighbors(const Vec3& pos, Fn&& fn) const {
-        int cx = clampi((int)std::floor((pos.x - mn_.x) * inv_), nx_);
-        int cy = clampi((int)std::floor((pos.y - mn_.y) * inv_), ny_);
-        int cz = clampi((int)std::floor((pos.z - mn_.z) * inv_), nz_);
-        for (int dz = -1; dz <= 1; ++dz) {
-            int z = cz + dz; if (z < 0 || z >= nz_) continue;
-            for (int dy = -1; dy <= 1; ++dy) {
-                int y = cy + dy; if (y < 0 || y >= ny_) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int x = cx + dx; if (x < 0 || x >= nx_) continue;
-                    int c = (z * ny_ + y) * nx_ + x;
-                    for (int k = start_[c]; k < start_[c + 1]; ++k) fn(order_[k]);
-                }
+    void forNeighborRanges(const Vec3& pos, Fn&& fn) const {
+        const int cx = cellCoord(pos.x, mn_.x, nx_);
+        const int cy = cellCoord(pos.y, mn_.y, ny_);
+        const int cz = cellCoord(pos.z, mn_.z, nz_);
+        const int x0 = std::max(cx - 1, 0), x1 = std::min(cx + 1, nx_ - 1);
+        for (int z = std::max(cz - 1, 0); z <= std::min(cz + 1, nz_ - 1); ++z) {
+            for (int y = std::max(cy - 1, 0); y <= std::min(cy + 1, ny_ - 1); ++y) {
+                const int row = (z * ny_ + y) * nx_;
+                fn(start_[row + x0], start_[row + x1 + 1]);
             }
         }
     }
 
-private:
-    static int clampi(int v, int n) { return v < 0 ? 0 : (v >= n ? n - 1 : v); }
-    int cellIndex(const Vec3& p) const {
-        int x = clampi((int)std::floor((p.x - mn_.x) * inv_), nx_);
-        int y = clampi((int)std::floor((p.y - mn_.y) * inv_), ny_);
-        int z = clampi((int)std::floor((p.z - mn_.z) * inv_), nz_);
-        return (z * ny_ + y) * nx_ + x;
+    // Calls fn(index) for every candidate point around `pos`.
+    template <class Fn>
+    void forNeighbors(const Vec3& pos, Fn&& fn) const {
+        forNeighborRanges(pos, [&](int begin, int end) {
+            for (int k = begin; k < end; ++k) fn(order_[k]);
+        });
     }
 
-    float cell_ = 1, inv_ = 1;
-    Vec3 mn_{};
-    int nx_ = 1, ny_ = 1, nz_ = 1;
-    std::vector<int> cellOf_, start_, order_;
+private:
+    [[nodiscard]] int cellCoord(float v, float lo, int n) const noexcept {
+        return std::clamp(static_cast<int>(std::floor((v - lo) * inv_)), 0, n - 1);
+    }
+    [[nodiscard]] int cellIndex(const Vec3& p) const noexcept {
+        return (cellCoord(p.z, mn_.z, nz_) * ny_ + cellCoord(p.y, mn_.y, ny_)) * nx_ + cellCoord(p.x, mn_.x, nx_);
+    }
+
+    float inv_ = 1;
+    Vec3  mn_{};
+    int   nx_ = 1, ny_ = 1, nz_ = 1;
+    std::vector<int> cellOf_, start_, cursor_, order_;
 };

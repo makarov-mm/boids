@@ -15,11 +15,14 @@ around them, exactly like a starling murmuration under attack.
 - **Predators** — hunters that chase the nearest boid; the flock tears open and
   closes back up around them. This is the visual payoff.
 - **Scales to ~12k+ agents** — neighbour queries run through a uniform spatial
-  hash (counting sort, O(N)), and the whole step is multi-threaded with a tiny
-  `std::thread` pool. No rayon, no TBB.
+  hash (counting sort, O(N)) over agent data gathered in cell order, and the
+  whole step runs on a small persistent `std::thread` pool with dynamic load
+  balancing. No TBB.
 - **Oriented rendering** — every agent is drawn as a small arrowhead pointing
   along its velocity and coloured by heading, so aligned sub-flocks read as
-  coherent colour and you can see the flow direction at a glance.
+  coherent colour and you can see the flow direction at a glance. The
+  arrowheads are built on the GPU: one instanced draw straight from the
+  simulation's position and velocity arrays.
 - **Optional obstacle** — a sphere the flock has to stream around.
 - **On-screen HUD** — live FPS, population, and the full key legend, drawn with
   an embedded bitmap font (no GDI, no external font files).
@@ -28,15 +31,13 @@ around them, exactly like a starling murmuration under attack.
 
 ## Build & run
 
-1. Open `BoidsViewer.sln` in **Visual Studio 2022**.
+1. Open `BoidsViewer.slnx` in **Visual Studio 2026** (toolset v145).
 2. Select **Release | x64**.
 3. Run with **Ctrl+F5**.
 
-Release matters — Debug is far too slow for this many agents. Run on a machine
-with real GPU drivers (OpenGL 3.3+); it will not work over Remote Desktop.
-
-If Visual Studio reports the **v143** toolset is missing, right-click the
-solution -> *Retarget solution* and pick your installed toolset.
+Release matters — Debug is far too slow for this many agents. Run on Windows 10
+(1703+) or 11 with real GPU drivers (OpenGL 3.3+); it will not work over Remote
+Desktop.
 
 There is no CMake build here; the project is Windows-only by design (native
 Win32 windowing + WGL context).
@@ -49,9 +50,9 @@ Win32 windowing + WGL context).
 | Mouse wheel | Zoom |
 | `Space` | Pause / resume |
 | `Up` / `Down` | Simulation speed (substeps per frame) |
-| `O` | Toggle the spherical obstacle |
-| `P` | Toggle predators on / off |
-| `R` | Reset |
+| `O` | Toggle the spherical obstacle (live — the flock reacts from where it is) |
+| `P` | Toggle predators on / off (live) |
+| `R` | Reset to the initial flock |
 | `H` | Show / hide the HUD |
 | `Esc` | Quit |
 
@@ -81,39 +82,26 @@ spatial hash) with their own speed and turn limits.
 The naive all-pairs version is O(N^2) and dies past a couple thousand agents.
 Instead the boids are bucketed into a uniform grid whose cell size equals the
 perception radius, built each frame with a counting sort. A neighbour query
-then only visits the 3x3x3 block of cells around an agent — O(N) overall and
-cache-friendly. The per-agent work (sense + steer) is split across hardware
-threads; acceleration and integration are separated into phases so there are no
-data races.
+then only visits the 3x3x3 block of cells around an agent — O(N) overall.
+Positions and velocities are gathered into cell order first, so a query reads
+contiguous memory and consecutive agents share most of their candidates in the
+cache. Candidates are first filtered without branching (two out of three lie
+outside the perception sphere, at random, which a branch would keep
+mispredicting), then the neighbours are accumulated in their original order.
+The per-agent work (sense + steer) is handed out to the worker threads in
+small blocks, so dense flocks do not leave threads idle; acceleration and
+integration are separated into phases so there are no data races.
 
 ### Rendering
 
-The simulation lives in continuous space. Each frame the viewer builds a small
-camera-facing arrowhead per agent, oriented along its velocity, and uploads the
-triangles in one streaming buffer. Colour comes from the normalised heading
+The simulation lives in continuous space. Each frame the viewer uploads the
+position and velocity arrays as they are, and the vertex shader builds a small
+camera-facing arrowhead per instance, oriented along its velocity. Colour comes
+from the normalised heading
 (plus a brightness boost from speed), which makes locally aligned groups share
 a colour and turns the whole flock into a shifting field of colour domains.
 Predators are larger red darts. A wireframe box bounds the domain, and the HUD
 is a second screen-space pass using an embedded font atlas.
-
-## Verification
-
-The flocking core is checked headless (see `src/verify.cpp`), which is useful
-because the renderer can't be unit-tested:
-
-- **Spatial hash correctness** — neighbour counts from the grid are compared
-  against a brute-force O(N^2) reference and must match exactly.
-- **Flock dynamics** — the Vicsek order parameter (mean normalised velocity) is
-  tracked over time. It starts near zero for a random cloud and rises as the
-  flock aligns; mean nearest-neighbour distance settles to a stable value
-  (separation prevents collapse, cohesion prevents dispersal); speeds stay
-  inside the configured band.
-
-Build and run it separately if you want the numbers:
-
-```
-cl /std:c++20 /O2 /EHsc /I src src\boids.cpp src\verify.cpp /Fe:verify.exe
-```
 
 ## Tuning
 
@@ -128,6 +116,7 @@ All of the behaviour lives in `BoidsParams` (`src/boids.hpp`):
 | `maxSpeed`, `minSpeed`, `maxForce` | Agility and speed band |
 | `fleeRadius`, `wFlee` | How sharply boids react to predators |
 | `obstacle`, `obstacleCenter`, `obstacleRadius` | The sphere obstacle |
+| `threads` | Simulation threads (0 = one per hardware thread) |
 
 The defaults are tuned for large, sweeping flocks.
 
@@ -135,21 +124,25 @@ The defaults are tuned for large, sweeping flocks.
 
 ```
 src/
-  vec3.hpp         3D vector maths
-  mat4.hpp         matrices + orbit camera
-  hashgrid.hpp     uniform spatial hash (counting sort)
-  boids.hpp/.cpp   flock + predators + obstacle, multi-threaded
-  viewer_win32.cpp native Win32 + WGL viewer (arrowheads, box, HUD)
-  font_atlas.hpp   embedded bitmap font for the HUD
-  verify.cpp       headless correctness / dynamics checks
+  vec3.hpp               3D vector maths
+  mat4.hpp               matrices + orbit camera
+  hashgrid.hpp           uniform spatial hash (counting sort)
+  thread_pool.hpp/.cpp   persistent worker pool, dynamic blocks
+  boids.hpp/.cpp         flock + predators + obstacle, multi-threaded
+  gl_api.hpp/.cpp        OpenGL 3.3 entry points loaded at runtime
+  renderer.hpp/.cpp      instanced arrowheads, box / obstacle lines, HUD
+  viewer_win32.cpp       Win32 window, WGL context, input, frame loop
+  font_atlas.hpp         embedded bitmap font for the HUD
 ```
 
 ## Technical notes
 
 - **Native Win32 + WGL** — the window, input loop and GL context are all set up
-  by hand; there is no GLFW/GLAD/GLEW. Modern GL functions are loaded at runtime
-  via `wglGetProcAddress`.
-- **C++20**, no third-party dependencies.
+  by hand; there is no GLFW/GLAD/GLEW. The viewer asks for an OpenGL 3.3 core
+  context (`WGL_ARB_create_context`), and the GL functions are loaded at runtime
+  from one X-macro list via `wglGetProcAddress`.
+- **Per-monitor DPI aware** — the window and the HUD scale with the display.
+- **C++23** (`/std:c++latest`), no third-party dependencies.
 - The work scales across cores with a hand-rolled thread pool.
 
 ## License
